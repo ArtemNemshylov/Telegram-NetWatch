@@ -155,41 +155,60 @@ def get_my_ips() -> set[str]:
     return ips
 
 
-def get_gateway() -> str:
+def get_gateway_and_iface() -> tuple[str, str]:
+    """Returns (gateway_ip, interface_name)."""
     if GATEWAY_IP:
-        return GATEWAY_IP
+        gw = GATEWAY_IP
+        iface = _detect_iface_for_gateway(gw)
+        return gw, iface
     try:
         if platform.system() == 'Darwin':
             out = subprocess.check_output(
                 ['route', '-n', 'get', 'default'], text=True, stderr=subprocess.DEVNULL
             )
-            return re.search(r'gateway:\s+(\S+)', out).group(1)
+            gw    = re.search(r'gateway:\s+(\S+)', out).group(1)
+            iface = re.search(r'interface:\s+(\S+)', out).group(1)
+            return gw, iface
         else:
-            out = subprocess.check_output(['ip', 'route', 'show', 'default'], text=True)
-            return out.split()[out.split().index('via') + 1]
+            out   = subprocess.check_output(['ip', 'route', 'show', 'default'], text=True)
+            parts = out.split()
+            gw    = parts[parts.index('via') + 1]
+            iface = parts[parts.index('dev') + 1]
+            return gw, iface
     except Exception:
         print('[!] Cannot auto-detect gateway. Set GATEWAY_IP in .env', flush=True)
         sys.exit(1)
+
+
+def _detect_iface_for_gateway(gw: str) -> str:
+    try:
+        out   = subprocess.check_output(['ip', 'route', 'get', gw], text=True)
+        parts = out.split()
+        return parts[parts.index('dev') + 1]
+    except Exception:
+        from scapy.all import conf
+        return conf.iface
 
 
 def get_network_cidr(gateway: str) -> str:
     return NETWORK or (gateway.rsplit('.', 1)[0] + '.0/24')
 
 
-def get_mac(ip: str) -> str:
+def get_mac(ip: str, iface: str) -> str:
     from scapy.all import ARP, Ether, srp
-    ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff') / ARP(pdst=ip), timeout=2, verbose=False)
+    ans, _ = srp(Ether(dst='ff:ff:ff:ff:ff:ff') / ARP(pdst=ip),
+                 iface=iface, timeout=2, verbose=False)
     if not ans:
         raise RuntimeError(f'No ARP reply from {ip}')
     return ans[0][1].hwsrc
 
 
-def scan_hosts(network: str, gateway: str, my_ips: set[str]) -> dict[str, str]:
+def scan_hosts(network: str, gateway: str, my_ips: set[str], iface: str) -> dict[str, str]:
     from scapy.all import ARP, Ether, srp
-    print(f'[*] Scanning {network}…', flush=True)
+    print(f'[*] Scanning {network} on {iface}…', flush=True)
     ans, _ = srp(
         Ether(dst='ff:ff:ff:ff:ff:ff') / ARP(pdst=network),
-        timeout=3, verbose=False,
+        iface=iface, timeout=3, verbose=False,
     )
     hosts = {
         rcv.psrc: rcv.hwsrc
@@ -242,7 +261,7 @@ def restore_arp(targets: dict[str, str], gateway_ip: str, gateway_mac: str) -> N
 
 # ── dns intercept ─────────────────────────────────────────────────────────────
 
-def start_dns_intercept(my_ips: set[str]) -> None:
+def start_dns_intercept(my_ips: set[str], iface: str) -> None:
     from scapy.all import sniff, DNS, DNSQR, IP, UDP, send as scapy_send
 
     def handle(pkt) -> None:
@@ -288,8 +307,8 @@ def start_dns_intercept(my_ips: set[str]) -> None:
             if DEBUG:
                 print(f'[!] DNS intercept error: {e}', flush=True)
 
-    print('[*] DNS interceptor running (sniffing udp port 53)…', flush=True)
-    sniff(filter='udp port 53', prn=handle, store=False)
+    print(f'[*] DNS interceptor running on {iface} (udp port 53)…', flush=True)
+    sniff(filter='udp port 53', prn=handle, store=False, iface=iface)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -298,11 +317,11 @@ def main() -> None:
     print('[*] Telegram NetWatch — MitM mode', flush=True)
 
     my_ips = get_my_ips()
-    gateway_ip = get_gateway()
-    print(f'[*] Gateway: {gateway_ip}', flush=True)
+    gateway_ip, iface = get_gateway_and_iface()
+    print(f'[*] Gateway: {gateway_ip}  interface: {iface}', flush=True)
 
     try:
-        gateway_mac = get_mac(gateway_ip)
+        gateway_mac = get_mac(gateway_ip, iface)
         print(f'[*] Gateway MAC: {gateway_mac}', flush=True)
     except RuntimeError as e:
         print(f'[!] {e}', flush=True)
@@ -312,13 +331,13 @@ def main() -> None:
         targets: dict[str, str] = {}
         for ip in [x.strip() for x in TARGET_IPS.split(',') if x.strip()]:
             try:
-                targets[ip] = get_mac(ip)
+                targets[ip] = get_mac(ip, iface)
                 print(f'[*] Target: {ip} ({targets[ip]})', flush=True)
             except RuntimeError:
                 print(f'[!] Cannot reach {ip} — skipping', flush=True)
     else:
         network = get_network_cidr(gateway_ip)
-        targets = scan_hosts(network, gateway_ip, my_ips)
+        targets = scan_hosts(network, gateway_ip, my_ips, iface)
 
     if not targets:
         print('[!] No targets found. Exiting.', flush=True)
@@ -347,7 +366,7 @@ def main() -> None:
     print(f'[*] Cooldown: {COOLDOWN_SEC}s per device+domain', flush=True)
 
     try:
-        start_dns_intercept(my_ips)     # blocks until Ctrl+C
+        start_dns_intercept(my_ips, iface)     # blocks until Ctrl+C
     except KeyboardInterrupt:
         pass
     finally:
