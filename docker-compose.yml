@@ -1,0 +1,14 @@
+services:
+  netwatch:
+    build: .
+    restart: unless-stopped
+    # host network is required so scapy sees all LAN traffic
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    env_file:
+      - .env
+    volumes:
+      # optional: persist blocklist cache between restarts (not used yet, future-proof)
+      - ./data:/data
