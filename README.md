@@ -67,6 +67,37 @@ All devices that connect to the router will automatically use NetWatch as their 
 
 ---
 
+## MitM mode — no router changes needed
+
+ARP-spoofs devices on your LAN so all their DNS queries come through NetWatch automatically — no router access required.
+
+```bash
+make run-mitm   # sudo required
+```
+
+How it works:
+- Sends fake ARP replies: tells every device "I am the router"
+- Enables IP forwarding so all non-DNS traffic passes through transparently
+- DNS queries hit the proxy on port 53 → Telegram notification on tracked domains
+- On Ctrl+C: restores real ARP tables, disables IP forwarding — network returns to normal
+
+Optional `.env` settings for MitM mode:
+
+```env
+# monitor specific devices only (default: all hosts on the network)
+TARGET_IPS=192.168.1.42,192.168.1.55
+
+# override auto-detected gateway
+GATEWAY_IP=192.168.1.1
+
+# override auto-detected network range
+NETWORK=192.168.1.0/24
+```
+
+> **Note:** ARP spoofing only works on your own network. Use responsibly.
+
+---
+
 ## Docker (Linux only)
 
 ```bash
@@ -102,8 +133,9 @@ All settings in `.env` (see `.env.example` for full list):
 ```
 make setup           Copy .env.example → .env
 make install         Install Python dependencies
-make run             Start DNS proxy (sudo)
-make debug           Start with DEBUG=true (sudo)
+make run             Start DNS proxy — requires router DNS change (sudo)
+make run-mitm        Start MitM mode — no router changes needed (sudo)
+make debug           Start DNS proxy with DEBUG=true (sudo)
 make test            Test pornhub.com against watchlist + Telegram
 make test DOMAIN=…   Test a custom domain
 make docker-up       Build and start Docker container

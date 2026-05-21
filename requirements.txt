@@ -1,3 +1,4 @@
 dnslib
+scapy
 requests
 python-dotenv

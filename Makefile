@@ -33,6 +33,9 @@ debug: .installed ## Start in debug mode — prints every DNS query
 test: .installed ## Test watchlist lookup + Telegram for a domain (make test DOMAIN=pornhub.com)
 	$(PYTHON) monitor.py --test $(DOMAIN)
 
+run-mitm: .installed ## MitM mode — ARP-spoof the LAN, no router changes needed (sudo)
+	sudo $(PYTHON) mitm.py
+
 docker-up: ## Build image and start container (detached)
 	docker compose up -d --build
 
