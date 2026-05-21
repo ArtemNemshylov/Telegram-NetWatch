@@ -1,24 +1,29 @@
 # Telegram NetWatch
 
-DNS proxy that tracks your network traffic and sends a Telegram notification when any device visits a domain from the watchlist (e.g. adult content).
+Monitors DNS traffic on your local network and sends a Telegram notification when a device visits a domain from the watchlist (adult content, etc.).
 
-Acts as a **DNS server** — all queries pass through it, so it sees traffic from every device on the network. No packet sniffing, no promiscuous mode.
+Works in two modes:
+- **MitM mode** — ARP-spoofs the LAN, intercepts DNS with Scapy. No router changes needed.
+- **DNS proxy mode** — acts as a DNS server. Requires pointing your router's DNS to this machine.
 
 ---
 
-## How it works
+## How it works (MitM mode)
 
 ```
- Router DHCP → sets DNS = this machine's IP
-                          │
- iPhone  ──┐              ▼
- Android ──┼──▶  Telegram NetWatch (UDP 53)
- Laptop  ──┘       │            │
-                   │            └─▶ 8.8.8.8 (upstream DNS)
-                   │
-                   └─▶ domain in watchlist?
-                             └─▶ YES → Telegram 👁
+ [Phone]  ──ARP spoofed──▶  [NetWatch]  ──forwards──▶  [8.8.8.8]
+              thinks we                    real DNS
+              are the router               response
+
+ Every DNS query passes through NetWatch:
+   domain in watchlist? → Telegram notification 👁
 ```
+
+1. Sends fake ARP replies to all devices: "I am the router"
+2. Sends fake ARP replies to the router: "I am each device"
+3. Enables IP forwarding so non-DNS traffic passes through transparently
+4. Scapy intercepts every DNS query, forwards it to upstream, checks the watchlist
+5. On Ctrl+C: restores real ARP tables, disables forwarding — network returns to normal
 
 ---
 
@@ -45,7 +50,7 @@ Open `.env` and fill in the two required values:
 | `TELEGRAM_TOKEN` | Message [@BotFather](https://t.me/BotFather) → `/newbot` |
 | `TELEGRAM_CHAT_ID` | Message [@userinfobot](https://t.me/userinfobot) → `/start` |
 
-### 3. Verify setup
+### 3. Verify Telegram works
 
 ```bash
 make test                       # tests pornhub.com (default)
@@ -55,46 +60,29 @@ make test DOMAIN=xhamster.com   # test any domain
 ### 4. Run
 
 ```bash
-make run   # requires sudo — port 53 is privileged
+make run-mitm   # MitM mode — no router changes (recommended)
+make run        # DNS proxy mode — requires router DNS change
 ```
 
-### 5. Point your network at it
-
-In your **router settings**, set the Primary DNS to this machine's local IP (e.g. `192.168.1.100`).  
-All devices that connect to the router will automatically use NetWatch as their DNS server.
-
-> To find your machine's local IP: `ipconfig getifaddr en0` (macOS) or `hostname -I` (Linux)
+Both require `sudo` (raw packet capture and port 53 binding).
 
 ---
 
-## MitM mode — no router changes needed
-
-ARP-spoofs devices on your LAN so all their DNS queries come through NetWatch automatically — no router access required.
-
-```bash
-make run-mitm   # sudo required
-```
-
-How it works:
-- Sends fake ARP replies: tells every device "I am the router"
-- Enables IP forwarding so all non-DNS traffic passes through transparently
-- DNS queries hit the proxy on port 53 → Telegram notification on tracked domains
-- On Ctrl+C: restores real ARP tables, disables IP forwarding — network returns to normal
-
-Optional `.env` settings for MitM mode:
+## MitM mode options
 
 ```env
-# monitor specific devices only (default: all hosts on the network)
+# Monitor specific devices only (default: all hosts on the network)
 TARGET_IPS=192.168.1.42,192.168.1.55
 
-# override auto-detected gateway
+# Override auto-detected gateway
 GATEWAY_IP=192.168.1.1
 
-# override auto-detected network range
+# Override auto-detected network range
 NETWORK=192.168.1.0/24
-```
 
-> **Note:** ARP spoofing only works on your own network. Use responsibly.
+# Seconds between ARP bursts (default: 2)
+SPOOF_INTERVAL=2
+```
 
 ---
 
@@ -107,24 +95,22 @@ make docker-logs  # tail logs
 make docker-down  # stop
 ```
 
-> Uses `network_mode: host` — works on **Linux**. On macOS Docker Desktop, host networking is not supported; run natively with `make run`.
+> `network_mode: host` is required and only works on **Linux**.
+> On macOS, run natively with `make run-mitm`.
 
 ---
 
-## Configuration
-
-All settings in `.env` (see `.env.example` for full list):
+## Configuration reference
 
 | Variable | Default | Description |
 |---|---|---|
 | `TELEGRAM_TOKEN` | — | **Required.** Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | — | **Required.** Your chat or group ID |
 | `UPSTREAM_DNS` | `8.8.8.8` | DNS server to forward queries to |
-| `LISTEN_PORT` | `53` | Port to listen on |
-| `BLOCKLIST_URL` | chadmayfield's list | URL of a plain-text domain watchlist |
+| `BLOCKLIST_URL` | chadmayfield's adult list | URL of a plain-text domain watchlist |
 | `REFRESH_HOURS` | `24` | How often to re-download the watchlist |
-| `COOLDOWN_SEC` | `300` | Seconds before re-notifying for the same device+domain |
-| `DEBUG` | `false` | Print every DNS query, not just tracked ones |
+| `COOLDOWN_SEC` | `300` | Seconds before re-notifying for same device+domain |
+| `DEBUG` | `false` | Print every DNS query to stdout |
 
 ---
 
@@ -133,9 +119,9 @@ All settings in `.env` (see `.env.example` for full list):
 ```
 make setup           Copy .env.example → .env
 make install         Install Python dependencies
-make run             Start DNS proxy — requires router DNS change (sudo)
-make run-mitm        Start MitM mode — no router changes needed (sudo)
-make debug           Start DNS proxy with DEBUG=true (sudo)
+make run             DNS proxy mode (sudo)
+make run-mitm        MitM mode — no router changes (sudo)
+make debug           DNS proxy with DEBUG=true (sudo)
 make test            Test pornhub.com against watchlist + Telegram
 make test DOMAIN=…   Test a custom domain
 make docker-up       Build and start Docker container
@@ -143,3 +129,40 @@ make docker-down     Stop Docker container
 make docker-logs     Tail Docker logs
 make docker-rebuild  Rebuild and restart Docker container
 ```
+
+---
+
+## Limitations
+
+### DNS-over-HTTPS (DoH)
+The biggest blind spot. Chrome, Firefox, and iOS/Android can send DNS queries over HTTPS (port 443, encrypted) directly to Cloudflare or Google — completely bypassing UDP port 53. NetWatch won't see those queries.
+
+**Workarounds:**
+- Disable DoH in browser settings (Chrome: `chrome://settings/security` → Secure DNS → off)
+- Block DoH providers at the router level (block `1.1.1.1`, `8.8.8.8`, `9.9.9.9` on port 443)
+- Use Pi-hole as the DNS server and disable DoH on devices
+
+### DNS caching
+If a device already has a domain cached, it won't make a new DNS query until the TTL expires. NetWatch will miss the visit entirely during the cache window (typically 5 minutes to 24 hours).
+
+### WiFi client isolation
+Some routers have AP Isolation enabled, which blocks direct communication between WiFi clients. ARP spoofing won't reach other devices in this case. Usually disabled on home routers but common in public/office WiFi.
+
+### IPv6
+Only IPv4 DNS (A records) is intercepted. Devices using IPv6 DNS (`AAAA` queries over IPv6) are not monitored. Most home networks are IPv4-only, so this rarely matters.
+
+### Local machine not monitored in MitM mode
+The machine running NetWatch bypasses its own interceptor (to avoid routing loops). To monitor the local machine too, use `make run` (DNS proxy mode) and point local DNS to `127.0.0.1`.
+
+### Requires sudo
+Both modes require root privileges — MitM for raw packet capture (Scapy), DNS proxy for binding to port 53.
+
+### macOS only for native mode
+Docker's `network_mode: host` doesn't work on macOS Docker Desktop. Run natively on macOS. On a Linux server or Raspberry Pi, Docker works fine.
+
+### ARP spoof is detectable
+Any device running ARP monitoring software (e.g. XArp) can detect the spoofing. Not an issue for personal home network use.
+
+---
+
+> **Use only on networks you own or have permission to monitor.**
