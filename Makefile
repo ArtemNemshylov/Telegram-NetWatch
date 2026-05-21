@@ -17,16 +17,20 @@ setup: ## Copy .env.example → .env (edit it before running)
 		echo "  .env created. Open it and fill in TELEGRAM_TOKEN and TELEGRAM_CHAT_ID."; \
 	fi
 
-install: ## Install Python dependencies
+# rebuilt whenever requirements.txt changes
+.installed: requirements.txt
 	pip install -r requirements.txt
+	@touch .installed
 
-run: ## Start the monitor (requires sudo for packet capture)
+install: .installed ## Install Python dependencies
+
+run: .installed ## Start the monitor (requires sudo for packet capture)
 	sudo $(PYTHON) monitor.py
 
-debug: ## Start in debug mode — prints every DNS query
+debug: .installed ## Start in debug mode — prints every DNS query
 	sudo DEBUG=true $(PYTHON) monitor.py
 
-test: ## Test blocklist lookup + Telegram for a domain (make test DOMAIN=pornhub.com)
+test: .installed ## Test watchlist lookup + Telegram for a domain (make test DOMAIN=pornhub.com)
 	$(PYTHON) monitor.py --test $(DOMAIN)
 
 docker-up: ## Build image and start container (detached)

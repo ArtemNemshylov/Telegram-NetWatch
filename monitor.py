@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram NetWatch — DNS-based network monitor with Telegram alerts.
-Captures UDP port 53 queries and sends a notification when a device visits a tracked domain.
-Requires root/sudo for packet capture.
+Telegram NetWatch — DNS proxy with Telegram alerts.
+Listens on UDP 53, forwards every query to an upstream DNS server,
+and sends a Telegram notification when a device visits a tracked domain.
+
+Setup: point your router's DNS (or each device's DNS) to this machine's IP.
+Requires root/sudo — port 53 is privileged.
 """
 import os
 import sys
@@ -14,33 +17,36 @@ import bisect
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
-from scapy.all import sniff, DNS, DNSQR, IP, get_if_list
+from dnslib import DNSRecord
 
 load_dotenv()
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+UPSTREAM_DNS     = os.environ.get('UPSTREAM_DNS', '8.8.8.8')
+UPSTREAM_PORT    = int(os.environ.get('UPSTREAM_PORT', '53'))
+LISTEN_HOST      = os.environ.get('LISTEN_HOST', '0.0.0.0')
+LISTEN_PORT      = int(os.environ.get('LISTEN_PORT', '53'))
 BLOCKLIST_URL    = os.environ.get(
     'BLOCKLIST_URL',
     'https://raw.githubusercontent.com/chadmayfield/my-pihole-blocklists/master/lists/pi_blocklist_porn_all.list',
 )
 REFRESH_HOURS = int(os.environ.get('REFRESH_HOURS', '24'))
 COOLDOWN_SEC  = int(os.environ.get('COOLDOWN_SEC', '300'))
-IFACE         = os.environ.get('IFACE', '')
 DEBUG         = os.environ.get('DEBUG', '').lower() in ('1', 'true', 'yes')
 
-# sorted list → O(log n) bisect lookup, ~2x less RAM than a hash set
+# sorted list → O(log n) bisect, ~2x less RAM than a hash set
 blocklist: list[str] = []
 device_cache: dict[str, str] = {}
 cooldown_cache: dict[str, float] = {}
 lock = threading.Lock()
 
 
-# ── blocklist ─────────────────────────────────────────────────────────────────
+# ── watchlist ─────────────────────────────────────────────────────────────────
 
 def load_blocklist() -> None:
     global blocklist
-    print('[*] Downloading blocklist…', flush=True)
+    print('[*] Downloading watchlist…', flush=True)
     try:
         resp = requests.get(BLOCKLIST_URL, timeout=60)
         resp.raise_for_status()
@@ -51,9 +57,9 @@ def load_blocklist() -> None:
         })
         with lock:
             blocklist = domains
-        print(f'[*] Blocklist loaded: {len(blocklist):,} domains', flush=True)
+        print(f'[*] Watchlist loaded: {len(blocklist):,} domains', flush=True)
     except Exception as e:
-        print(f'[!] Blocklist download failed: {e}', flush=True)
+        print(f'[!] Watchlist download failed: {e}', flush=True)
         sys.exit(1)
 
 
@@ -63,7 +69,7 @@ def refresh_loop() -> None:
         load_blocklist()
 
 
-def is_blocked(domain: str) -> bool:
+def is_tracked(domain: str) -> bool:
     domain = domain.lower().rstrip('.')
     with lock:
         bl = blocklist
@@ -115,50 +121,78 @@ def get_device_name(ip: str) -> str:
     return name
 
 
-# ── packet handler ────────────────────────────────────────────────────────────
+# ── notify ────────────────────────────────────────────────────────────────────
 
-def packet_handler(pkt) -> None:
+def notify(src_ip: str, domain: str) -> None:
+    cooldown_key = f'{src_ip}:{domain}'
+    now = time.monotonic()
+    if cooldown_cache.get(cooldown_key, 0) + COOLDOWN_SEC > now:
+        return
+    cooldown_cache[cooldown_key] = now
+
+    device = get_device_name(src_ip)
+    ts = datetime.now().strftime('%H:%M:%S  %d.%m.%Y')
+    print(f'[TRACK] {device} ({src_ip}) → {domain}', flush=True)
+
+    msg = (
+        f'👁 <b>Activity tracked</b>\n\n'
+        f'📱 <b>Device:</b> {device}\n'
+        f'🔌 <b>IP:</b> <code>{src_ip}</code>\n'
+        f'🌐 <b>Domain:</b> <code>{domain}</code>\n'
+        f'🕐 <b>Time:</b> {ts}'
+    )
+    threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
+
+
+# ── dns proxy ─────────────────────────────────────────────────────────────────
+
+def handle_query(sock: socket.socket, data: bytes, client_addr: tuple) -> None:
     try:
-        if not (pkt.haslayer(DNS) and pkt.haslayer(DNSQR) and pkt.haslayer(IP)):
-            return
-        if pkt[DNS].qr != 0:
-            return
+        request = DNSRecord.parse(data)
+        domain = str(request.q.qname).rstrip('.')
+        src_ip = client_addr[0]
 
-        src_ip = pkt[IP].src
-        domain = pkt[DNSQR].qname.decode('utf-8', errors='replace').rstrip('.')
-
-        if len(domain) < 4:
-            return
-
-        blocked = is_blocked(domain)
         if DEBUG:
-            print(f'[{"TRACK" if blocked else "     "}] {src_ip} → {domain}', flush=True)
+            print(f'[DNS] {src_ip} → {domain}', flush=True)
 
-        if not blocked:
-            return
+        # forward raw bytes to upstream — no modification
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        upstream.settimeout(5)
+        upstream.sendto(data, (UPSTREAM_DNS, UPSTREAM_PORT))
+        response, _ = upstream.recvfrom(4096)
+        upstream.close()
 
-        device = get_device_name(src_ip)
-        cooldown_key = f'{src_ip}:{domain}'
-        now = time.monotonic()
+        # reply to client first, then check watchlist (keeps latency low)
+        sock.sendto(response, client_addr)
 
-        if cooldown_cache.get(cooldown_key, 0) + COOLDOWN_SEC > now:
-            return
-        cooldown_cache[cooldown_key] = now
-
-        ts = datetime.now().strftime('%H:%M:%S  %d.%m.%Y')
-        print(f'[TRACK] {device} ({src_ip}) → {domain}', flush=True)
-
-        msg = (
-            f'👁 <b>Activity tracked</b>\n\n'
-            f'📱 <b>Device:</b> {device}\n'
-            f'🔌 <b>IP:</b> <code>{src_ip}</code>\n'
-            f'🌐 <b>Domain:</b> <code>{domain}</code>\n'
-            f'🕐 <b>Time:</b> {ts}'
-        )
-        threading.Thread(target=send_telegram, args=(msg,), daemon=True).start()
+        if is_tracked(domain):
+            notify(src_ip, domain)
 
     except Exception as e:
-        print(f'[!] packet_handler error: {e}', flush=True)
+        print(f'[!] Query error from {client_addr}: {e}', flush=True)
+
+
+def start_server() -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((LISTEN_HOST, LISTEN_PORT))
+    except PermissionError:
+        print(f'[!] Cannot bind to port {LISTEN_PORT} — run with sudo.', flush=True)
+        sys.exit(1)
+    except OSError as e:
+        print(f'[!] Bind failed: {e}', flush=True)
+        sys.exit(1)
+
+    print(f'[*] DNS proxy listening on {LISTEN_HOST}:{LISTEN_PORT}', flush=True)
+    print(f'[*] Upstream DNS: {UPSTREAM_DNS}:{UPSTREAM_PORT}', flush=True)
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            threading.Thread(target=handle_query, args=(sock, data, addr), daemon=True).start()
+        except Exception as e:
+            print(f'[!] Server loop error: {e}', flush=True)
 
 
 # ── cli commands ──────────────────────────────────────────────────────────────
@@ -167,7 +201,7 @@ def cmd_test(domain: str) -> None:
     """Test watchlist lookup and Telegram delivery for a given domain."""
     load_blocklist()
     domain = domain.lower().strip()
-    tracked = is_blocked(domain)
+    tracked = is_tracked(domain)
     print(f'[TEST] {domain} → {"in watchlist ✅" if tracked else "not in watchlist ❌"}', flush=True)
     if not tracked:
         return
@@ -192,26 +226,13 @@ if __name__ == '__main__':
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         send_telegram(
             f'✅ <b>Telegram NetWatch started</b>\n'
-            f'Watchlist: {len(blocklist):,} domains'
+            f'Watchlist: {len(blocklist):,} domains\n'
+            f'Upstream DNS: {UPSTREAM_DNS}'
         )
         print('[*] Startup message sent to Telegram', flush=True)
     else:
         print('[WARN] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set — notifications will print to stdout only', flush=True)
 
     threading.Thread(target=refresh_loop, daemon=True).start()
-
-    if IFACE:
-        ifaces = [IFACE]
-    else:
-        all_ifaces = get_if_list()
-        # en* = physical adapters on macOS (WiFi/Ethernet); eth* on Linux
-        ifaces = [i for i in all_ifaces if re.match(r'^(en|eth)\d+$', i)]
-        if not ifaces:
-            skip = re.compile(r'^(lo|anpi|utun|bridge|gif|stf|awdl|llw|ap)')
-            ifaces = [i for i in all_ifaces if not skip.match(i)]
-
-    print(f'[*] Sniffing on: {ifaces}', flush=True)
     print(f'[*] Cooldown: {COOLDOWN_SEC}s per device+domain', flush=True)
-    print('[*] Waiting for DNS queries…', flush=True)
-
-    sniff(filter='udp port 53', prn=packet_handler, store=False, iface=ifaces)
+    start_server()
