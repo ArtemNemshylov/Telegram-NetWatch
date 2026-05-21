@@ -256,7 +256,7 @@ def start_dns_intercept(my_ips: set[str]) -> None:
             src_ip  = pkt[IP].src
             dst_ip  = pkt[IP].dst       # original destination (e.g. 8.8.8.8)
             sport   = pkt[UDP].sport
-            domain  = str(pkt[DNSQR].qname).rstrip('.')
+            domain  = pkt[DNSQR].qname.decode('utf-8', errors='replace').rstrip('.')
 
             if src_ip in my_ips:        # ignore our own queries
                 return
